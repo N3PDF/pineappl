@@ -17,8 +17,8 @@ title: PineAPPL
 email: christopher.schwan@mi.infn.it
 #description: >- # this means to ignore newlines until "baseurl:"
 
-baseurl: "" # the subpath of your site, e.g. /blog
-url: "https://n3pdf.github.io/pineappl" # the base hostname & protocol for your site, e.g. http://example.com
+baseurl: "/pineappl" # the subpath of your site, e.g. /blog
+url: "https://n3pdf.github.io" # the base hostname & protocol for your site, e.g. http://example.com
 #twitter_username: jekyllrb
 #github_username:  jekyll
 
