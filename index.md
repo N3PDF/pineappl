@@ -46,7 +46,7 @@ Make sure that all the required environment variables are set. See the
 ## Links to all the supporting documentation
 
 - [Rust API documentation](https://docs.rs/pineappl)
-- [C API reference](https://crates.io/crates/pineappl_capi)
+- [C API reference](https://docs.rs/pineappl_capi/0.2.0/pineappl_capi/)
 
 ## How to cite PineAPPL?
 
