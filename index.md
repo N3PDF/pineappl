@@ -39,6 +39,9 @@ and finally the command-line program:
 Make sure that all the required environment variables are set. See the
 `README.md` of `pineappl_capi` for further instructions.
 
+For the python interface please refer to the dedicated documentation
+in [pineappl.readthedocs.io](https://pineappl.readthedocs.io/).
+
 ## How to use the supporting scripts?
 
 - (run.sh)
