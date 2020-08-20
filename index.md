@@ -42,14 +42,11 @@ Make sure that all the required environment variables are set. See the
 For the python interface please refer to the dedicated documentation
 in [pineappl.readthedocs.io](https://pineappl.readthedocs.io/).
 
-## How to use the supporting scripts?
-
-- (run.sh)
-
 ## Links to all the supporting documentation
 
 - [Rust API documentation](https://docs.rs/pineappl)
 - [C API reference](https://docs.rs/pineappl_capi/0.2.0/pineappl_capi/)
+- [Python API](https://pineappl.readthedocs.io/)
 
 ## How to cite PineAPPL?
 
@@ -64,8 +61,17 @@ The PineAPPL grids generated for the paper are available in a [dedicated git lfs
 
 ### ATLAS high-mass Drell-Yan lepton pair measurement at 7 TeV
 
+<img src="images/pineappl_ATLASZHIGHMASS49FB.svg" style="width: 50%;"/>
+
 ### CMS double-differential Drell-Yan lepton pair measurement at 7 TeV
+
+<img src="images/pineappl_CMSDY2D11_bin3.svg" style="width: 50%;"/><img src="images/pineappl_CMSDY2D11_bin4.svg" style="width: 50%;"/>
+<img src="images/pineappl_CMSDY2D11_bin5.svg" style="width: 50%;"/><img src="images/pineappl_CMSDY2D11_bin6.svg" style="width: 50%;"/>
 
 ### ATLAS differential top-quark pair measurement at 8 TeV
 
+<img src="images/pineappl_ATLAS_TTB_DIFF_8TEV_LJ_TPT.svg" style="width: 50%;"/><img src="images/pineappl_ATLAS_TTB_DIFF_8TEV_LJ_TTM.svg" style="width: 50%;"/>
+
 ### CMS differential Z pt measurement at 13 TeV
+
+<img src="images/pineappl_CMS_Z_13_TEV.svg" style="width: 50%;"/>
