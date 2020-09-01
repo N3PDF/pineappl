@@ -51,9 +51,8 @@ in [pineappl.readthedocs.io](https://pineappl.readthedocs.io/).
 ## How to cite PineAPPL?
 
 If you use the package please cite the following [Zenodo](https://zenodo.org/) and [arXiv](https://arxiv.org/) references:
-- [https://doi.org/10.5281/zenodo.3890291](https://doi.org/10.5281/zenodo.3890291)
-- https://arxiv.org/abs/20xx.xxxxx
-
+- [10.5281/zenodo.3890291](https://doi.org/10.5281/zenodo.3890291)
+- [arXiv:2008.12789](https://arxiv.org/abs/2008.12789)
 
 ## Links to the grids in the paper
 
