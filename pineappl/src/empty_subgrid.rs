@@ -9,7 +9,7 @@ use std::iter;
 use std::ops::Range;
 
 /// A subgrid type that is always empty.
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct EmptySubgridV1 {}
 
 impl Subgrid for EmptySubgridV1 {
@@ -28,15 +28,15 @@ impl Subgrid for EmptySubgridV1 {
     }
 
     fn q2_grid(&self) -> Cow<[f64]> {
-        unreachable!();
+        Cow::Borrowed(&[])
     }
 
     fn x1_grid(&self) -> Cow<[f64]> {
-        unreachable!();
+        Cow::Borrowed(&[])
     }
 
     fn x2_grid(&self) -> Cow<[f64]> {
-        unreachable!();
+        Cow::Borrowed(&[])
     }
 
     fn is_empty(&self) -> bool {

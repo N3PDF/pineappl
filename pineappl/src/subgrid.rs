@@ -13,7 +13,7 @@ use std::ops::Range;
 
 /// Enum which lists all possible `Subgrid` variants possible.
 #[enum_dispatch(Subgrid)]
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub enum SubgridEnum {
     // WARNING: never change the order or content of this enum, only add to the end of it
     /// Lagrange-interpolation subgrid.
@@ -90,7 +90,7 @@ pub trait Subgrid {
 }
 
 /// Subgrid creation parameters for subgrids that perform interpolation.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubgridParams {
     q2_bins: usize,
     q2_max: f64,

@@ -5,14 +5,17 @@ use super::empty_subgrid::EmptySubgridV1;
 use super::import_only_subgrid::ImportOnlySubgridV1;
 use super::lagrange_subgrid::{LagrangeSparseSubgridV1, LagrangeSubgridV1, LagrangeSubgridV2};
 use super::lumi::LumiEntry;
+use super::lumi_entry;
 use super::ntuple_subgrid::NtupleSubgridV1;
+use super::sparse_array3::SparseArray3;
 use super::subgrid::{ExtraSubgridParams, Subgrid, SubgridEnum, SubgridParams};
 use either::Either::{Left, Right};
 use float_cmp::approx_eq;
 use git_version::git_version;
+use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use lz_fear::{framed::DecompressionError::WrongMagic, LZ4FrameReader};
-use ndarray::{Array3, Dimension};
+use ndarray::{s, Array3, Array5, Dimension};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -123,16 +126,16 @@ pub enum GridMergeError {
 #[error("tried constructing a Grid with unknown Subgrid type `{0}`")]
 pub struct UnknownSubgrid(String);
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Mmv1 {}
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Mmv2 {
     remapper: Option<BinRemapper>,
     key_value_db: HashMap<String, String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Mmv3 {
     remapper: Option<BinRemapper>,
     key_value_db: HashMap<String, String>,
@@ -190,7 +193,7 @@ impl Mmv3 {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 enum MoreMembers {
     V1(Mmv1),
     V2(Mmv2),
@@ -219,6 +222,15 @@ pub enum GridSetBinRemapperError {
         /// Number of bins in the remapper.
         remapper_bins: usize,
     },
+}
+
+/// Information required to compute a compatible EKO.
+/// Members spell out specific characteristic of a suitable EKO.
+pub struct EkoInfo {
+    /// is the interpolation grid in x used at the process scale
+    pub x_grid: Vec<f64>,
+    /// is the intepolation grid in q2, spanning the q2 range covered by the process data
+    pub q2_grid: Vec<f64>,
 }
 
 /// Main data structure of `PineAPPL`. This structure contains a `Subgrid` for each `LumiEntry`,
@@ -1126,6 +1138,608 @@ impl Grid {
         };
 
         key_value_db.insert(key.to_owned(), value.to_owned());
+    }
+
+    /// Provide information used to compute a suitable EKO for the current grid.
+    pub fn eko_info(&self) -> Option<EkoInfo> {
+        let mut q2_grid = Vec::<f64>::new();
+        let mut x_grid = Vec::<f64>::new();
+
+        for subgrid in &self.subgrids {
+            if !subgrid.is_empty() {
+                if q2_grid.is_empty() {
+                    q2_grid = subgrid.q2_grid().into_owned();
+                    let x = subgrid.x1_grid().into_owned();
+
+                    // if subgrid.x2_grid() != x {
+                    // return None;
+                    // }
+
+                    x_grid = x;
+                }
+                // } else if (subgrid.x1_grid() != x_grid) || (subgrid.x2_grid() != x_grid) {
+                // return None;
+                // }
+
+                q2_grid.append(&mut subgrid.q2_grid().into_owned());
+                q2_grid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                q2_grid.dedup();
+            }
+        }
+
+        Some(EkoInfo { x_grid, q2_grid })
+    }
+
+    /// More efficient version of [`convolute_eko`].
+    #[must_use]
+    pub fn convolute_eko2(
+        &self,
+        q2: f64,
+        alphas: &[f64],
+        (xir, xif): (f64, f64),
+        pids: &[i32],
+        x_grid: Vec<f64>,
+        q2_grid: Vec<f64>,
+        operator: Array5<f64>,
+    ) -> Option<Self> {
+        let dim = operator.shape();
+
+        assert_eq!(dim[0], q2_grid.len());
+        assert_eq!(dim[1], pids.len());
+        assert_eq!(dim[2], x_grid.len());
+        assert_eq!(dim[3], pids.len());
+        assert_eq!(dim[4], x_grid.len());
+
+        let operator = operator.permuted_axes([3, 1, 4, 0, 2]);
+        let operator = operator.as_standard_layout();
+
+        let initial_state_1 = self.key_values().map_or(2212, |map| {
+            map.get("initial_state_1").unwrap().parse::<i32>().unwrap()
+        });
+        let initial_state_2 = self.key_values().map_or(2212, |map| {
+            map.get("initial_state_2").unwrap().parse::<i32>().unwrap()
+        });
+
+        // TODO: determine the following by simply checking the x1 and x2 grid lengths
+        let has_pdf1 = match initial_state_1 {
+            2212 | -2212 => true,
+            11 | 13 | -11 | -13 => false,
+            _ => unimplemented!(),
+        };
+        let has_pdf2 = match initial_state_2 {
+            2212 | -2212 => true,
+            11 | 13 | -11 | -13 => false,
+            _ => unimplemented!(),
+        };
+
+        let pids1 = if has_pdf1 {
+            pids.to_vec()
+        } else {
+            vec![initial_state_1]
+        };
+        let pids2 = if has_pdf2 {
+            pids.to_vec()
+        } else {
+            vec![initial_state_2]
+        };
+
+        let lumi: Vec<_> = pids1
+            .iter()
+            .cartesian_product(pids2.iter())
+            .map(|(a, b)| lumi_entry![*a, *b, 1.0])
+            .collect();
+
+        let tgt_q2_grid = vec![q2];
+        let tgt_x1_grid = if has_pdf1 { x_grid.clone() } else { vec![1.0] };
+        let tgt_x2_grid = if has_pdf2 { x_grid.clone() } else { vec![1.0] };
+
+        let mut result = Self {
+            subgrids: Array3::from_shape_simple_fn((1, self.bin_info().bins(), lumi.len()), || {
+                EmptySubgridV1::default().into()
+            }),
+            lumi: lumi.clone(),
+            bin_limits: self.bin_limits.clone(),
+            orders: vec![Order {
+                alphas: 0,
+                alpha: 0,
+                logxir: 0,
+                logxif: 0,
+            }],
+            subgrid_params: SubgridParams::default(),
+            more_members: self.more_members.clone(),
+        };
+
+        let eko_info = self.eko_info().unwrap();
+
+        let bar = ProgressBar::new(
+            (self.bin_info().bins() * self.lumi.len() * pids1.len() * pids2.len()) as u64,
+        );
+        bar.set_style(ProgressStyle::default_bar().template(
+            "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} - ETA: {eta_precise} {msg}",
+        ));
+
+        // iterate over all bins, which are mapped one-to-one from the target to the source grid
+        for bin in 0..self.bin_info().bins() {
+            // iterate over the source grid luminosities
+            for (src_lumi, src_entries) in self.lumi.iter().enumerate() {
+                // create a sorted and unique vector with the `q2` for all orders
+                let mut src_array_q2_grid: Vec<f64> = (0..self.orders.len())
+                    .flat_map(|order| self.subgrids[[order, bin, src_lumi]].q2_grid().into_owned())
+                    .collect();
+                src_array_q2_grid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                src_array_q2_grid.dedup();
+                let src_array_q2_grid = src_array_q2_grid;
+
+                let mut src_array = SparseArray3::<f64>::new(
+                    src_array_q2_grid.len(),
+                    if has_pdf1 { eko_info.x_grid.len() } else { 1 },
+                    if has_pdf2 { eko_info.x_grid.len() } else { 1 },
+                );
+
+                // iterate over the source grid orders and add all of them together into
+                // `src_array`, using the right powers of alphas
+                for (order, powers) in self.orders.iter().enumerate() {
+                    let logs = if (xir, xif) == (1.0, 1.0) {
+                        if (powers.logxir > 0) || (powers.logxif > 0) {
+                            continue;
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        (xir * xir).ln().powi(powers.logxir.try_into().unwrap())
+                            * (xif * xif).ln().powi(powers.logxif.try_into().unwrap())
+                    };
+
+                    let src_subgrid = &self.subgrids[[order, bin, src_lumi]];
+
+                    for ((iq2, ix1, ix2), &value) in src_subgrid.iter() {
+                        let scale = src_subgrid.q2_grid()[iq2];
+                        let src_iq2 = src_array_q2_grid
+                            .iter()
+                            .position(|&q2| q2 == scale)
+                            .unwrap();
+                        let als_iq2 = q2_grid
+                            .iter()
+                            .position(|&q2| q2 == xir * xir * scale)
+                            .unwrap();
+
+                        src_array[[src_iq2, ix1, ix2]] +=
+                            alphas[als_iq2].powi(powers.alphas.try_into().unwrap()) * logs * value;
+                    }
+                }
+
+                let src_array = src_array;
+
+                if src_array.is_empty() {
+                    bar.inc((pids1.len() * pids2.len()) as u64);
+                    continue;
+                }
+
+                for (tgt_lumi, (tgt_pid1_idx, tgt_pid2_idx)) in (0..pids1.len())
+                    .cartesian_product(0..pids2.len())
+                    .enumerate()
+                {
+                    for (src_pid1, src_pid2, factor) in src_entries.entry().iter() {
+                        let src_pid1_idx = if has_pdf1 {
+                            pids.iter()
+                                .position(|x| {
+                                    // if `pid == 0` the gluon is meant
+                                    if *src_pid1 == 0 {
+                                        *x == 21
+                                    } else {
+                                        x == src_pid1
+                                    }
+                                })
+                                .unwrap()
+                        } else {
+                            0
+                        };
+                        let src_pid2_idx = if has_pdf2 {
+                            pids.iter()
+                                .position(|x| {
+                                    // `pid == 0` is the gluon exception, which might be 0 or 21
+                                    if *src_pid2 == 0 {
+                                        *x == 21
+                                    } else {
+                                        x == src_pid2
+                                    }
+                                })
+                                .unwrap()
+                        } else {
+                            0
+                        };
+
+                        let mut tgt_array =
+                            SparseArray3::new(1, tgt_x1_grid.len(), tgt_x2_grid.len());
+
+                        let op1 = operator.slice(s![tgt_pid1_idx, src_pid1_idx, .., .., ..]);
+                        let op2 = operator.slice(s![tgt_pid2_idx, src_pid2_idx, .., .., ..]);
+
+                        // -- this is by far the slowest section, and has to be optimized
+
+                        for (tgt_x1_idx, tgt_x2_idx) in
+                            (0..tgt_x1_grid.len()).cartesian_product(0..tgt_x2_grid.len())
+                        {
+                            for ((src_q2_idx, src_x1_idx, src_x2_idx), value) in
+                                src_array.indexed_iter()
+                            {
+                                let eko_src_q2_idx = q2_grid
+                                    .iter()
+                                    .position(|&q2| q2 == src_array_q2_grid[src_q2_idx])
+                                    .unwrap();
+
+                                let mut value = factor * value;
+
+                                if has_pdf1 {
+                                    value *= op1[[tgt_x1_idx, eko_src_q2_idx, src_x1_idx]];
+                                }
+
+                                if has_pdf2 {
+                                    value *= op2[[tgt_x2_idx, eko_src_q2_idx, src_x2_idx]];
+                                }
+
+                                // it's possible that at least one of the operators is zero
+                                if value == 0.0 {
+                                    continue;
+                                }
+
+                                tgt_array[[0, tgt_x1_idx, tgt_x2_idx]] += value;
+                            }
+                        }
+
+                        // --
+
+                        if !tgt_array.is_empty() {
+                            let mut tgt_subgrid = mem::replace(
+                                &mut result.subgrids[[0, bin, tgt_lumi]],
+                                EmptySubgridV1::default().into(),
+                            );
+
+                            let mut subgrid = match tgt_subgrid {
+                                SubgridEnum::EmptySubgridV1(_) => ImportOnlySubgridV1::new(
+                                    tgt_array,
+                                    tgt_q2_grid.clone(),
+                                    tgt_x1_grid.clone(),
+                                    tgt_x2_grid.clone(),
+                                )
+                                .into(),
+                                SubgridEnum::ImportOnlySubgridV1(ref mut array) => {
+                                    let array = array.array_mut();
+
+                                    for ((_, tgt_x1_idx, tgt_x2_idx), &value) in
+                                        tgt_array.indexed_iter()
+                                    {
+                                        array[[0, tgt_x1_idx, tgt_x2_idx]] += value;
+                                    }
+
+                                    tgt_subgrid
+                                }
+                                _ => unreachable!(),
+                            };
+
+                            mem::swap(&mut subgrid, &mut result.subgrids[[0, bin, tgt_lumi]]);
+                        }
+                    }
+
+                    bar.inc(1);
+                }
+            }
+        }
+
+        bar.finish();
+
+        Some(result)
+    }
+
+    /// Applies an evolution kernel operator (EKO) to the grids to evolve them from different
+    /// values of the factorization scale to a single one given by the parameter `q2`.
+    #[must_use]
+    pub fn convolute_eko(
+        &self,
+        q2: f64,
+        alphas: &[f64],
+        (xir, xif): (f64, f64),
+        pids: &[i32],
+        x_grid: Vec<f64>,
+        q2_grid: Vec<f64>,
+        operator: Array5<f64>,
+    ) -> Option<Self> {
+        let dim = operator.shape();
+
+        assert_eq!(dim[0], q2_grid.len());
+        assert_eq!(dim[1], pids.len());
+        assert_eq!(dim[2], x_grid.len());
+        assert_eq!(dim[3], pids.len());
+        assert_eq!(dim[4], x_grid.len());
+
+        let mut operator_new = Array5::zeros((dim[3], dim[1], dim[4], dim[0], dim[2]));
+        operator_new.assign(&operator.permuted_axes([3, 1, 4, 0, 2]));
+        let operator = operator_new;
+
+        //operator[q2h, ph, xh, pl, xl];
+        //operator_new[pl, ph, xl, q2h, xh];
+        // let EkoInfo { x_grid, q2_grid } = if let Some(eko_info) = self.eko_info() {
+        // eko_info
+        // } else {
+        // return None;
+        // };
+        println!("{:?}\n{:?}", x_grid, q2_grid);
+
+        let initial_state_1 = self.key_values().map_or(2212, |map| {
+            map.get("initial_state_1").unwrap().parse::<i32>().unwrap()
+        });
+        let initial_state_2 = self.key_values().map_or(2212, |map| {
+            map.get("initial_state_2").unwrap().parse::<i32>().unwrap()
+        });
+        let has_pdf1 = match initial_state_1 {
+            2212 | -2212 => true,
+            11 | 13 | -11 | -13 => false,
+            _ => unimplemented!(),
+        };
+        let has_pdf2 = match initial_state_2 {
+            2212 | -2212 => true,
+            11 | 13 | -11 | -13 => false,
+            _ => unimplemented!(),
+        };
+
+        let pids1 = if has_pdf1 {
+            pids.to_vec()
+        } else {
+            vec![initial_state_1]
+        };
+        let pids2 = if has_pdf2 {
+            pids.to_vec()
+        } else {
+            vec![initial_state_2]
+        };
+
+        let lumi: Vec<_> = pids1
+            .iter()
+            .cartesian_product(pids2.iter())
+            .map(|(a, b)| lumi_entry![*a, *b, 1.0])
+            .collect();
+
+        let q2low_grid = vec![q2];
+        let x1low_grid = if has_pdf1 { x_grid.clone() } else { vec![1.] };
+        let x2low_grid = if has_pdf2 { x_grid.clone() } else { vec![1.] };
+        let x1_len = x1low_grid.len();
+        let x2_len = x2low_grid.len();
+
+        // TODO: extend `with_subgrid_type` constructor and use it!
+        let mut result = Self {
+            subgrids: Array3::from_shape_simple_fn((1, self.bin_info().bins(), lumi.len()), || {
+                ImportOnlySubgridV1::new(
+                    SparseArray3::new(1, x1_len, x2_len),
+                    q2low_grid.clone(),
+                    x1low_grid.clone(),
+                    x2low_grid.clone(),
+                )
+                .into()
+            }),
+            lumi: lumi.clone(),
+            bin_limits: self.bin_limits.clone(),
+            orders: vec![Order {
+                alphas: 0,
+                alpha: 0,
+                logxir: 0,
+                logxif: 0,
+            }],
+            subgrid_params: SubgridParams::default(),
+            more_members: self.more_members.clone(),
+        };
+        // println!(
+        // "lumi: {:?}, bin: {:?}, order: {:?}",
+        // result.lumi, result.bin_limits, result.orders
+        // );
+
+        // TODO: put original perturbative orders and order of the EKO inside new metadata
+        fn compute_eko_high_index(
+            eko_grid: &Vec<f64>,
+            high_grid: &Cow<[f64]>,
+        ) -> HashMap<usize, usize> {
+            let mut eko_map = HashMap::new();
+            for (i, el) in high_grid.iter().enumerate() {
+                let eko_i = eko_grid.iter().position(|x| x == el).unwrap_or_else(|| {
+                    // panic!("while looking for: '{}' in:\n{:?}", el, eko_grid)
+                    // TODO: we're slicing q2grid in eko, to skip the full operator calculation so
+                    // it's returning a stupid index, just to say that is not computed
+                    999999
+                });
+                eko_map.insert(i, eko_i);
+            }
+            eko_map
+        }
+
+        let mut orders_len = 0;
+        for order in &self.orders {
+            if ((order.logxir > 0) && (xir == 1.0)) || ((order.logxif > 0) && (xif == 1.0)) {
+                continue;
+            }
+            orders_len += 1;
+        }
+
+        let bar = ProgressBar::new((result.subgrids.len() * orders_len * self.lumi.len()) as u64);
+        bar.set_style(ProgressStyle::default_bar().template(
+            "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} - ETA: {eta_precise} {msg}",
+        ));
+
+        // println!("{:?}, {:?}", pids1, pids2);
+
+        // Iterate over RESULT = LOW
+        for ((_, bin, low_lumi), subgrid) in result.subgrids.indexed_iter_mut() {
+            // if bin > 0 {
+            // continue;
+            // }
+            let mut array = SparseArray3::<f64>::new(1, x1_len, x2_len);
+
+            let eko_pid_low1_idx = pids1
+                .iter()
+                .position(|pid| *pid == lumi[low_lumi].entry()[0].0)
+                .unwrap();
+            let eko_pid_low2_idx = pids2
+                .iter()
+                .position(|pid| *pid == lumi[low_lumi].entry()[0].1)
+                .unwrap();
+
+            // Iterate over SELF = HIGH
+            for (order_idx, order) in self.orders.iter().enumerate() {
+                // if order_idx > 0 {
+                // continue;
+                // }
+                // skip log grids if we don't want the scale varied from the central choice
+                if ((order.logxir > 0) && (xir == 1.0)) || ((order.logxif > 0) && (xif == 1.0)) {
+                    continue;
+                }
+                let mut eko_mapping_done = false;
+                let mut eko_x1_high_idx = HashMap::new();
+                let mut eko_x2_high_idx = HashMap::new();
+                let mut eko_q2_high_idx = HashMap::new();
+
+                // Iterate over SELF = HIGH
+                for (high_lumi_idx, high_lumi) in self.lumi.iter().enumerate() {
+                    // println!("ll: {}, o: {}, hl: {}", low_lumi, order_idx, high_lumi_idx);
+                    bar.inc(1);
+
+                    let subgrid_high = &self.subgrids[[order_idx, bin, high_lumi_idx]];
+                    if subgrid_high.is_empty() {
+                        continue;
+                    }
+                    let x1high_grid = self.subgrids[[order_idx, bin, high_lumi_idx]].x1_grid();
+                    let x2high_grid = self.subgrids[[order_idx, bin, high_lumi_idx]].x2_grid();
+                    let q2high_grid = self.subgrids[[order_idx, bin, high_lumi_idx]].q2_grid();
+
+                    // TODO: for the time being compute the mapping only for the first non-empty
+                    // subgrid, assuming that from that on the interpolation grids are not going to
+                    // change
+                    if !eko_mapping_done {
+                        eko_x1_high_idx = compute_eko_high_index(&x_grid, &x1high_grid);
+                        eko_x2_high_idx = compute_eko_high_index(&x_grid, &x2high_grid);
+                        eko_q2_high_idx = compute_eko_high_index(&q2_grid, &q2high_grid);
+                        eko_mapping_done = true;
+                    }
+
+                    // Iterate over SELF = HIGH
+                    for (pid_high1, pid_high2, factor) in high_lumi.entry() {
+                        // TODO: check all PIDs in self if EKOs are available
+                        let pid_high1 = if pid_high1 == &0 { &21 } else { pid_high1 };
+                        let pid_high2 = if pid_high2 == &0 { &21 } else { pid_high2 };
+
+                        let eko_pid_high1_idx =
+                            pids1.iter().position(|pid| pid == pid_high1).unwrap();
+                        let eko_pid_high2_idx =
+                            pids2.iter().position(|pid| pid == pid_high2).unwrap();
+
+                        // Iterate over RESULT = LOW
+                        // Note that the grid iterated is intended to be the eko one, since
+                        // x1low_grid is already set to the grid passed as input
+                        for (x1_low, x2_low) in (0..x1_len).cartesian_product(0..x2_len) {
+                            // Iterate over SELF = HIGH
+                            let convoluted = subgrid_high.convolute(
+                                &x1high_grid,
+                                &x2high_grid,
+                                &[],
+                                Left(&|x1_high_idx, x2_high_idx, q2_index| {
+                                    // index for the EK operator
+                                    // let eko_x1_high_idx = x_grid
+                                    // .iter()
+                                    // .position(|x| x == &x1high_grid[x1_high_idx])
+                                    // .unwrap();
+                                    // let eko_x2_high_idx = x_grid
+                                    // .iter()
+                                    // .position(|x| x == &x2high_grid[x2_high_idx])
+                                    // .unwrap();
+                                    // let eko_q2_index = q2_grid
+                                    // .iter()
+                                    // .position(|q2| q2 == &q2high_grid[q2_index])
+                                    // .unwrap_or_else(|| {
+                                    // eprintln!("{}: {}", q2_index, q2high_grid[q2_index]);
+                                    // panic!();
+                                    // });
+                                    let op1 = if has_pdf1 {
+                                        //operator[[
+                                        //    eko_q2_high_idx[&q2_index],
+                                        //    eko_pid_high1_idx,
+                                        //    eko_x1_high_idx[&x1_high_idx],
+                                        //    eko_pid_low1_idx,
+                                        //    x1_low,
+                                        //]]
+                                        operator[[
+                                            eko_pid_low1_idx,
+                                            eko_pid_high1_idx,
+                                            x1_low,
+                                            eko_q2_high_idx[&q2_index],
+                                            eko_x1_high_idx[&x1_high_idx],
+                                        ]]
+                                    } else {
+                                        1.
+                                    };
+                                    let op2 = if has_pdf2 {
+                                        //operator[[
+                                        //    eko_q2_high_idx[&q2_index],
+                                        //    eko_pid_high2_idx,
+                                        //    eko_x2_high_idx[&x2_high_idx],
+                                        //    eko_pid_low2_idx,
+                                        //    x2_low,
+                                        //]]
+                                        operator[[
+                                            eko_pid_low2_idx,
+                                            eko_pid_high2_idx,
+                                            x2_low,
+                                            eko_q2_high_idx[&q2_index],
+                                            eko_x2_high_idx[&x2_high_idx],
+                                        ]]
+                                    } else {
+                                        1.
+                                    };
+
+                                    let value = alphas[eko_q2_high_idx[&q2_index]]
+                                        .powi(order.alphas.try_into().unwrap())
+                                        * op1
+                                        * op2;
+
+                                    // TODO: implement scale variations
+
+                                    //if order.logxir > 0 {
+                                    //    value *= (xir * xir)
+                                    //        .ln()
+                                    //        .powi(order.logxir.try_into().unwrap());
+                                    //}
+
+                                    //if order.logxif > 0 {
+                                    //    value *= (xif * xif)
+                                    //        .ln()
+                                    //        .powi(order.logxif.try_into().unwrap());
+                                    //}
+
+                                    value
+                                }),
+                            );
+
+                            let saved = factor * convoluted;
+                            if saved != 0. {
+                                array[[0, x1_low, x2_low]] += saved;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // println!(
+            // "order: {:?} - {:?}, bin: {:?}, low_lumi: {:?} - {:?}",
+            // low_order, result.orders[low_order], bin, low_lumi, result.lumi[low_lumi]
+            // );
+            *subgrid = ImportOnlySubgridV1::new(
+                array,
+                q2low_grid.clone(),
+                x1low_grid.clone(),
+                x2low_grid.clone(),
+            )
+            .into();
+        }
+        bar.finish();
+        println!("orders: {:?}", result.orders());
+
+        Some(result)
     }
 }
 
